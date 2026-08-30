@@ -1,0 +1,38 @@
+@import "tailwindcss";
+
+@theme {
+  --color-app-bg: #080d17;
+  --color-sidebar-bg: #0b111d;
+  --color-panel: #0d1421;
+  --color-panel-2: #111a29;
+  --color-border: #202b3d;
+  --color-border-light: #2a3650;
+  --color-text-main: #f4f6fb;
+  --color-text-muted: #8995a8;
+  --color-accent: #704cff;
+  --color-accent-light: #8b6cff;
+  --color-success: #35d879;
+  --color-warning: #f5b73b;
+  --color-danger: #ef5350;
+}
+
+body {
+  background-color: var(--color-app-bg);
+  color: var(--color-text-main);
+  font-family: Inter, system-ui, -apple-system, sans-serif;
+  overflow: hidden;
+}
+
+/* Custom scrollbar for dark theme */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #2a3650; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #3a4760; }
+
+/* React-PDF specific overrides for dark mode */
+.react-pdf__Page__canvas {
+  box-shadow: 0 20px 55px rgba(0, 0, 0, 0.35);
+}
+.react-pdf__Page__textContent {
+  color: #181818 !important;
+}
