@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef, useCallback } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Document, Page, pdfjs } from "react-pdf";
 import {
   Loader2,
@@ -9,95 +9,107 @@ import {
   ZoomOut,
   Maximize,
   Minimize,
+  Search,
+  PanelLeft,
+  PanelRight,
 } from "lucide-react";
 import type { Document as DocType } from "../../types";
+import { useScrollWindow } from "../../hooks/useScrollWindow";
 
-// REQUIRED — without these, the (invisible) text/annotation layers render
-// as visible, unstyled, overlapping text on top of the canvas. This is the
-// most common cause of "react-pdf looks broken" bug reports.
 import "react-pdf/dist/Page/TextLayer.css";
 import "react-pdf/dist/Page/AnnotationLayer.css";
 
 pdfjs.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjs.version}/pdf.worker.min.mjs`;
 
+type FitMode = "width" | "page" | "custom";
+
+const RENDER_DPR = Math.min(window.devicePixelRatio || 1, 2);
+
+const STAGE_PAD_X = 24;
+const STAGE_PAD_Y = 24;
+const PAGE_GAP = 24;
+const PAGE_OVERSCAN = 1;
+
+const THUMB_WIDTH = 84;
+const THUMB_GAP = 12;
+const THUMB_PAD_Y = 12;
+const THUMB_OVERSCAN = 4;
+
+const DEFAULT_ASPECT = 1.414;
+const DEFAULT_NATURAL_WIDTH = 612;
+
 interface Props {
   fileUrl: string | null;
   targetPage: number | null;
   document: DocType | null;
+  isSidebarOpen: boolean;
+  isChatOpen: boolean;
+  onToggleSidebar: () => void;
+  onToggleChat: () => void;
 }
 
-type FitMode = "width" | "page" | "custom";
-
-// Cap devicePixelRatio so we don't blow up canvas memory on very high-DPI
-// screens, but still render crisp text instead of the browser's default (1x).
-const RENDER_DPR = Math.min(window.devicePixelRatio || 1, 2);
-
-export default function PDFViewer({ fileUrl, targetPage, document }: Props) {
-  const [numPages, setNumPages] = useState<number>(0);
-  const [currentPage, setCurrentPage] = useState<number>(1);
-  const [pageInputValue, setPageInputValue] = useState<string>("1");
+export default function PDFViewer({
+  fileUrl,
+  targetPage,
+  document,
+  isSidebarOpen,
+  isChatOpen,
+  onToggleSidebar,
+  onToggleChat,
+}: Props) {
+  const [numPages, setNumPages] = useState(0);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageInputValue, setPageInputValue] = useState("1");
   const [fitMode, setFitMode] = useState<FitMode>("width");
-  const [zoomLevel, setZoomLevel] = useState<number>(100); // Only used when fitMode is 'custom'
+  const [zoomLevel, setZoomLevel] = useState(100);
   const [error, setError] = useState<string | null>(null);
-  const [isPageLoading, setIsPageLoading] = useState(true);
+  const [isDocLoading, setIsDocLoading] = useState(true);
 
-  const containerRef = useRef<HTMLDivElement>(null);
-  const [containerSize, setContainerSize] = useState({
-    width: 800,
-    height: 1000,
+  const [pageAspectRatio, setPageAspectRatio] = useState(DEFAULT_ASPECT);
+  const [naturalWidth, setNaturalWidth] = useState(DEFAULT_NATURAL_WIDTH);
+
+  const scrollLockRef = useRef<{ page: number; until: number } | null>(null);
+
+  // Stage hook: used ONLY for measurement + scrollTop (range computed below)
+  const stage = useScrollWindow({
+    count: numPages,
+    itemSize: 1,
+    padTop: STAGE_PAD_Y,
+    overscan: 0,
+    resetKey: fileUrl,
   });
 
-  // The REAL aspect ratio (height / width) of the current PDF's pages,
-  // learned from the first successfully-rendered page. Falls back to A4
-  // until we know better — this replaces the hardcoded 1.414 that caused
-  // mismatched wrapper sizing / gaps for non-A4 documents.
-  const [pageAspectRatio, setPageAspectRatio] = useState<number>(1.414);
+  const thumbSlot = THUMB_WIDTH * pageAspectRatio + THUMB_GAP;
+  const rail = useScrollWindow({
+    count: numPages,
+    itemSize: thumbSlot,
+    padTop: THUMB_PAD_Y,
+    overscan: THUMB_OVERSCAN,
+    resetKey: fileUrl,
+  });
 
-  // Measure the container (debounced via rAF, not on every resize tick)
-  useEffect(() => {
-    if (!containerRef.current) return;
-    let raf = 0;
-    const observer = new ResizeObserver((entries) => {
-      cancelAnimationFrame(raf);
-      raf = requestAnimationFrame(() => {
-        const entry = entries[0];
-        if (!entry) return;
-        setContainerSize({
-          width: entry.contentRect.width,
-          height: entry.contentRect.height,
-        });
-      });
-    });
-    observer.observe(containerRef.current);
-    return () => {
-      cancelAnimationFrame(raf);
-      observer.disconnect();
-    };
-  }, []);
-
-  // Derive the actual page render width from container size + fit mode +
-  // the real page aspect ratio (once known).
-  const pageWidth = (() => {
-    const padding = 48; // 24px each side
-    const { width: cw, height: ch } = containerSize;
-
-    if (fitMode === "width") {
-      return Math.max(300, cw - padding);
-    }
+  // ---- Geometry -----------------------------------------------------------
+  const pageWidth = useMemo(() => {
+    const availW = (stage.viewport.width || 900) - STAGE_PAD_X * 2;
+    const availH = (stage.viewport.height || 700) - STAGE_PAD_Y * 2;
+    if (fitMode === "width") return Math.max(200, availW);
     if (fitMode === "page") {
-      const maxWidth = cw - padding;
-      const maxHeight = ch - padding;
-      let width = maxHeight / pageAspectRatio;
-      if (width > maxWidth) width = maxWidth;
-      return Math.max(300, width);
+      return Math.max(200, Math.min(availH / pageAspectRatio, availW));
     }
-    // custom zoom, relative to a 800px baseline
-    return 800 * (zoomLevel / 100);
-  })();
+    return Math.max(120, naturalWidth * (zoomLevel / 100));
+  }, [
+    stage.viewport.width,
+    stage.viewport.height,
+    fitMode,
+    pageAspectRatio,
+    naturalWidth,
+    zoomLevel,
+  ]);
 
   const pageHeight = pageWidth * pageAspectRatio;
+  const slot = pageHeight + PAGE_GAP;
 
-  // Reset state on new document
+  // ---- Reset on new document ----------------------------------------------
   useEffect(() => {
     setCurrentPage(1);
     setPageInputValue("1");
@@ -105,49 +117,112 @@ export default function PDFViewer({ fileUrl, targetPage, document }: Props) {
     setZoomLevel(100);
     setNumPages(0);
     setError(null);
-    setIsPageLoading(true);
-    setPageAspectRatio(1.414);
+    setIsDocLoading(true);
+    setPageAspectRatio(DEFAULT_ASPECT);
+    setNaturalWidth(DEFAULT_NATURAL_WIDTH);
+    scrollLockRef.current = null;
+    stage.scrollToOffset(0, "auto");
+    rail.scrollToOffset(0, "auto");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fileUrl]);
 
-  // Handle citation clicks / external page jumps
+  // ---- Scroll-spy (top-aligned, padding/gap aware) --------------------------
   useEffect(() => {
-    if (targetPage && targetPage >= 1 && targetPage <= numPages) {
-      setCurrentPage(targetPage);
-      setPageInputValue(String(targetPage));
+    if (!numPages || slot <= 0) return;
+    const lock = scrollLockRef.current;
+    if (lock && Date.now() < lock.until) {
+      setCurrentPage((prev) => (prev === lock.page ? prev : lock.page));
+      return;
     }
-  }, [targetPage, numPages]);
+    if (lock) scrollLockRef.current = null;
+    const idx = Math.min(
+      numPages,
+      Math.max(1, Math.floor((stage.scrollTop - STAGE_PAD_Y) / slot) + 1),
+    );
+    setCurrentPage((prev) => (prev === idx ? prev : idx));
+  }, [stage.scrollTop, numPages, slot]);
 
-  const goToPage = useCallback(
-    (page: number) => {
-      if (!Number.isFinite(page)) return;
-      const clamped = Math.min(Math.max(1, Math.round(page)), numPages || 1);
-      setIsPageLoading(true);
-      setCurrentPage(clamped);
-      setPageInputValue(String(clamped));
+  useEffect(() => {
+    setPageInputValue(String(currentPage));
+  }, [currentPage]);
+
+  // ---- Zoom / resize scroll anchoring ---------------------------------------
+  const prevSlotRef = useRef(slot);
+  useEffect(() => {
+    const prev = prevSlotRef.current;
+    if (prev === slot) return;
+    prevSlotRef.current = slot;
+    if (!numPages) return;
+    scrollLockRef.current = { page: currentPage, until: Date.now() + 200 };
+    stage.scrollToOffset(STAGE_PAD_Y + (currentPage - 1) * slot, "auto");
+  }, [slot, numPages, currentPage, stage]);
+
+  // ---- Navigation -------------------------------------------------------------
+  const railCenterThumb = useCallback(
+    (page: number, behavior: ScrollBehavior) => {
+      const el = rail.containerRef.current;
+      if (!el) return;
+      const offset =
+        THUMB_PAD_Y +
+        (page - 1) * thumbSlot -
+        el.clientHeight / 2 +
+        thumbSlot / 2;
+      rail.scrollToOffset(offset, behavior);
     },
-    [numPages],
+    [rail, thumbSlot],
   );
 
-  // Commit page-number input on blur/Enter, not on every keystroke
-  const handlePageInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setPageInputValue(e.target.value);
-  };
+  const goToPage = useCallback(
+    (page: number, behavior: ScrollBehavior = "smooth") => {
+      if (!numPages || slot <= 0) return;
+      const clamped = Math.min(numPages, Math.max(1, Math.round(page)));
+      scrollLockRef.current = {
+        page: clamped,
+        until: Date.now() + (behavior === "smooth" ? 900 : 200),
+      };
+      stage.scrollToOffset(STAGE_PAD_Y + (clamped - 1) * slot, behavior);
+      railCenterThumb(clamped, behavior);
+      setCurrentPage((prev) => (prev === clamped ? prev : clamped));
+    },
+    [numPages, slot, stage, railCenterThumb],
+  );
+
+  useEffect(() => {
+    if (targetPage && targetPage >= 1 && targetPage <= numPages) {
+      goToPage(targetPage, "smooth");
+    }
+  }, [targetPage, numPages, goToPage]);
+
+  // Keep active thumbnail visible during free scrolling
+  useEffect(() => {
+    if (!numPages) return;
+    if (scrollLockRef.current && Date.now() < scrollLockRef.current.until)
+      return;
+    const el = rail.containerRef.current;
+    if (!el) return;
+    const top = THUMB_PAD_Y + (currentPage - 1) * thumbSlot;
+    if (
+      top < el.scrollTop ||
+      top + thumbSlot > el.scrollTop + el.clientHeight
+    ) {
+      rail.scrollToOffset(top - el.clientHeight / 2 + thumbSlot / 2, "auto");
+    }
+  }, [currentPage, numPages, thumbSlot, rail]);
+
+  // ---- Page input ---------------------------------------------------------------
   const commitPageInput = () => {
     const parsed = parseInt(pageInputValue, 10);
-    if (Number.isFinite(parsed)) {
-      goToPage(parsed);
-    } else {
-      setPageInputValue(String(currentPage));
-    }
-  };
-  const handlePageInputKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter") {
-      (e.target as HTMLInputElement).blur();
-    }
+    if (Number.isFinite(parsed) && parsed !== currentPage) goToPage(parsed);
+    else setPageInputValue(String(currentPage));
   };
 
-  const handleFitWidth = () => setFitMode("width");
-  const handleFitPage = () => setFitMode("page");
+  const handlePageLoad = useCallback((page: any) => {
+    if (page?.originalWidth && page?.originalHeight) {
+      setPageAspectRatio(page.originalHeight / page.originalWidth);
+      setNaturalWidth(page.originalWidth);
+    }
+  }, []);
+
   const handleZoomIn = () => {
     setFitMode("custom");
     setZoomLevel((prev) => Math.min(300, prev + 25));
@@ -157,18 +232,75 @@ export default function PDFViewer({ fileUrl, targetPage, document }: Props) {
     setZoomLevel((prev) => Math.max(25, prev - 25));
   };
 
-  const handlePageLoadSuccess = (page: any) => {
-    // Learn the REAL aspect ratio from the rendered page instead of
-    // assuming A4. originalWidth/originalHeight are unscaled PDF units.
-    if (page?.originalWidth && page?.originalHeight) {
-      setPageAspectRatio(page.originalHeight / page.originalWidth);
+  // ---- Virtualized ranges (fully derived from LIVE scroll state) ---------------
+  const stageRange = useMemo(() => {
+    if (numPages <= 0) return { start: 1, end: 0 };
+    if (slot <= 0 || stage.viewport.height <= 0) {
+      return { start: 1, end: Math.min(numPages, 3) };
     }
-    setIsPageLoading(false);
-  };
+    const first = Math.floor((stage.scrollTop - STAGE_PAD_Y) / slot) + 1;
+    const last =
+      Math.ceil(
+        (stage.scrollTop + stage.viewport.height - STAGE_PAD_Y) / slot,
+      ) + 1;
+    let start = Math.max(1, Math.min(first, last) - PAGE_OVERSCAN);
+    let end = Math.min(numPages, Math.max(first, last) + PAGE_OVERSCAN);
+    // HARD GUARANTEE: the current page is never unrendered
+    start = Math.min(start, currentPage);
+    end = Math.max(end, currentPage);
+    return { start, end };
+  }, [numPages, slot, stage.scrollTop, stage.viewport.height, currentPage]);
 
+  const railRange = useMemo(
+    () => ({
+      start: Math.max(1, Math.min(rail.range.start, currentPage)),
+      end: Math.min(numPages, Math.max(rail.range.end, currentPage)),
+    }),
+    [rail.range.start, rail.range.end, currentPage, numPages],
+  );
+
+  const stagePages = useMemo(() => {
+    const list: number[] = [];
+    for (let p = stageRange.start; p <= stageRange.end; p++) list.push(p);
+    return list;
+  }, [stageRange.start, stageRange.end]);
+
+  const railPages = useMemo(() => {
+    const list: number[] = [];
+    for (let p = railRange.start; p <= railRange.end; p++) list.push(p);
+    return list;
+  }, [railRange.start, railRange.end]);
+
+  const stageTopSpacer = Math.max(0, (stageRange.start - 1) * slot);
+  const stageBottomSpacer = Math.max(0, (numPages - stageRange.end) * slot);
+  const railTopSpacer = Math.max(0, (railRange.start - 1) * thumbSlot);
+  const railBottomSpacer = Math.max(0, (numPages - railRange.end) * thumbSlot);
+
+  const toggleBtn =
+    "w-8 h-8 rounded flex items-center justify-center text-[#b5bfd0] hover:bg-[#172132] hover:text-white transition";
+
+  // ---- Empty state ---------------------------------------------------------------
   if (!fileUrl || !document) {
     return (
-      <div className="flex-1 flex items-center justify-center bg-app-bg text-text-muted">
+      <div className="relative flex-1 h-full min-h-0 flex items-center justify-center bg-app-bg text-text-muted">
+        {!isSidebarOpen && (
+          <button
+            onClick={onToggleSidebar}
+            title="Open Sidebar"
+            className={`absolute top-4 left-4 ${toggleBtn} border border-border-light bg-panel`}
+          >
+            <PanelLeft size={16} />
+          </button>
+        )}
+        {!isChatOpen && (
+          <button
+            onClick={onToggleChat}
+            title="Open Chat"
+            className={`absolute top-4 right-4 ${toggleBtn} border border-border-light bg-panel`}
+          >
+            <PanelRight size={16} />
+          </button>
+        )}
         <div className="text-center">
           <Maximize size={48} className="mx-auto mb-4 opacity-20" />
           <p className="text-lg font-medium">
@@ -181,44 +313,24 @@ export default function PDFViewer({ fileUrl, targetPage, document }: Props) {
   }
 
   return (
-    <div className="flex-1 flex flex-col min-w-0 border-r border-border bg-app-bg">
-      {/* Context Bar */}
-      <div className="h-24 px-6 border-b border-border flex items-center justify-between gap-5 shrink-0 bg-sidebar-bg/50">
-        <div className="min-w-0">
-          <div className="text-text-muted text-[11px] mb-1 font-semibold tracking-wider">
-            ACTIVE CONTEXT
-          </div>
-          <div className="text-[17px] font-semibold text-text-main truncate">
-            {document.title}
-          </div>
-          <div className="text-text-muted text-xs mt-1">PDF Document</div>
-        </div>
-        <div className="flex items-center gap-6 shrink-0">
-          <div className="pr-6 border-r border-border text-right">
-            <div className="text-[17px] font-semibold text-text-main">
-              {document.total_pages || "—"}
-            </div>
-            <div className="text-text-muted text-[10px] uppercase tracking-wider">
-              Pages
-            </div>
-          </div>
-          <div className="min-w-[65px]">
-            <strong className="text-success text-[13px] flex items-center gap-1.5">
-              <span className="w-2 h-2 rounded-full bg-success shadow-[0_0_7px_rgba(53,216,121,0.4)]"></span>
-              {document.status}
-            </strong>
-            <span className="block text-text-muted text-[10px] mt-1 uppercase tracking-wider">
-              Status
-            </span>
-          </div>
-        </div>
-      </div>
-
-      {/* Toolbar */}
-      <div className="h-[52px] border-b border-border flex items-center justify-between px-4 bg-panel shrink-0">
+    <div className="flex-1 h-full min-h-0 flex flex-col min-w-0 border-r border-border bg-app-bg">
+      {/* Toolbar (top row — context bar removed) */}
+      <div className="h-[52px] border-b border-border flex items-center justify-between px-4 bg-panel shrink-0 gap-3">
         <div className="flex items-center gap-1 bg-[#0b121e] border border-border rounded-md p-1">
+          {!isSidebarOpen && (
+            <>
+              <button
+                onClick={onToggleSidebar}
+                title="Open Sidebar"
+                className={toggleBtn}
+              >
+                <PanelLeft size={14} />
+              </button>
+              <div className="w-px h-4 bg-border mx-1"></div>
+            </>
+          )}
           <button
-            onClick={handleFitWidth}
+            onClick={() => setFitMode("width")}
             title="Fit to Width"
             className={`h-7 px-3 rounded text-[11px] font-medium flex items-center justify-center gap-1.5 transition ${fitMode === "width" ? "bg-accent/20 text-accent-light" : "text-[#b5bfd0] hover:bg-[#172132] hover:text-white"}`}
           >
@@ -226,7 +338,7 @@ export default function PDFViewer({ fileUrl, targetPage, document }: Props) {
           </button>
           <div className="w-px h-4 bg-border mx-1"></div>
           <button
-            onClick={handleFitPage}
+            onClick={() => setFitMode("page")}
             title="Fit Entire Page"
             className={`h-7 px-3 rounded text-[11px] font-medium flex items-center justify-center gap-1.5 transition ${fitMode === "page" ? "bg-accent/20 text-accent-light" : "text-[#b5bfd0] hover:bg-[#172132] hover:text-white"}`}
           >
@@ -242,21 +354,25 @@ export default function PDFViewer({ fileUrl, targetPage, document }: Props) {
           >
             <ChevronLeft size={16} />
           </button>
-
           <div className="flex items-center gap-2 px-2 text-xs text-[#d8deea] min-w-[85px] justify-center">
             <input
               type="number"
               min={1}
               max={numPages}
               value={pageInputValue}
-              onChange={handlePageInputChange}
+              onChange={(e) => setPageInputValue(e.target.value)}
               onBlur={commitPageInput}
-              onKeyDown={handlePageInputKeyDown}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                if (e.key === "Escape") {
+                  setPageInputValue(String(currentPage));
+                  (e.target as HTMLInputElement).blur();
+                }
+              }}
               className="w-10 bg-transparent border-b border-transparent hover:border-border-light focus:border-accent outline-none text-center text-text-main font-medium [-moz-appearance:_textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
             />
             <span className="text-text-muted">/ {numPages || "..."}</span>
           </div>
-
           <button
             onClick={() => goToPage(currentPage + 1)}
             disabled={currentPage >= numPages}
@@ -267,10 +383,14 @@ export default function PDFViewer({ fileUrl, targetPage, document }: Props) {
         </div>
 
         <div className="flex items-center gap-1 bg-[#0b121e] border border-border rounded-md p-1">
+          <button className={toggleBtn} title="Search in document">
+            <Search size={14} />
+          </button>
+          <div className="w-px h-4 bg-border mx-1"></div>
           <button
             onClick={handleZoomOut}
             title="Zoom Out"
-            className="w-7 h-7 rounded flex items-center justify-center text-[#b5bfd0] hover:bg-[#172132] hover:text-white transition"
+            className={toggleBtn}
           >
             <ZoomOut size={14} />
           </button>
@@ -280,71 +400,121 @@ export default function PDFViewer({ fileUrl, targetPage, document }: Props) {
           >
             {fitMode === "custom" ? `${zoomLevel}%` : "Auto"}
           </button>
-          <button
-            onClick={handleZoomIn}
-            title="Zoom In"
-            className="w-7 h-7 rounded flex items-center justify-center text-[#b5bfd0] hover:bg-[#172132] hover:text-white transition"
-          >
+          <button onClick={handleZoomIn} title="Zoom In" className={toggleBtn}>
             <ZoomIn size={14} />
           </button>
+          {!isChatOpen && (
+            <>
+              <div className="w-px h-4 bg-border mx-1"></div>
+              <button
+                onClick={onToggleChat}
+                title="Open Chat"
+                className={toggleBtn}
+              >
+                <PanelRight size={14} />
+              </button>
+            </>
+          )}
         </div>
       </div>
 
-      {/* Viewer Area */}
-      <div
-        ref={containerRef}
-        className="flex-1 min-h-0 overflow-auto bg-[#111925] flex items-start justify-center relative"
-        style={{ padding: fitMode === "page" ? "24px" : "48px 24px" }}
+      {/* Body: virtualized rail + continuous-scroll stage */}
+      <Document
+        file={fileUrl}
+        onLoadSuccess={({ numPages }) => {
+          setNumPages(numPages);
+          setIsDocLoading(false);
+        }}
+        onLoadError={() => setError("Failed to load PDF.")}
+        loading={null}
+        className="flex-1 min-h-0 flex overflow-hidden bg-[#111925]"
       >
-        {error && (
-          <div className="absolute top-8 left-1/2 -translate-x-1/2 bg-danger/10 text-danger p-4 rounded-lg flex items-center gap-2 border border-danger/20 z-10">
-            <AlertCircle size={20} /> {error}
-          </div>
-        )}
-
-        {isPageLoading && (
-          <div className="absolute inset-0 flex items-center justify-center z-10 pointer-events-none">
-            <Loader2
-              className="animate-spin text-accent opacity-50"
-              size={48}
-            />
-          </div>
-        )}
-
-        <Document
-          file={fileUrl}
-          onLoadSuccess={({ numPages }) => setNumPages(numPages)}
-          onLoadError={() => setError("Failed to load PDF.")}
-          loading={null}
+        {/* Thumbnail rail */}
+        <div
+          ref={rail.setContainerRef}
+          className="w-[110px] shrink-0 h-full overflow-y-auto border-r border-border bg-[#0d1421]"
         >
-          {/* No width/height transition here — animating a div that wraps a
-              <canvas> stretches the raster mid-transition and snaps once
-              react-pdf re-renders, which reads as a blurry warp. If you want
-              a fit-change animation, fade opacity instead. */}
-          <div
-            className="relative bg-white shadow-[0_8px_30px_rgba(0,0,0,0.5)]"
-            style={{
-              width: `${pageWidth}px`,
-              minHeight: `${pageHeight}px`,
-            }}
-          >
-            <Page
-              // Key only changes on document swap — NOT on page turn —
-              // so react-pdf can reuse/update the canvas instead of a full
-              // unmount/remount flash on every page change.
-              key={fileUrl ?? "doc"}
-              pageNumber={currentPage}
-              width={pageWidth}
-              devicePixelRatio={RENDER_DPR}
-              renderTextLayer={true}
-              renderAnnotationLayer={true}
-              onLoadSuccess={handlePageLoadSuccess}
-              onRenderError={() => setError("Failed to render page.")}
-              loading=""
-            />
+          <div style={{ paddingTop: THUMB_PAD_Y, paddingBottom: THUMB_PAD_Y }}>
+            <div style={{ height: railTopSpacer }} />
+            <div
+              className="flex flex-col items-center"
+              style={{ gap: THUMB_GAP }}
+            >
+              {railPages.map((p) => (
+                <button
+                  key={p}
+                  onClick={() => goToPage(p)}
+                  className={`shrink-0 bg-white rounded-sm overflow-hidden transition ${p === currentPage ? "ring-2 ring-accent" : "ring-1 ring-border opacity-70 hover:opacity-100"}`}
+                  style={{ width: THUMB_WIDTH }}
+                >
+                  <Page
+                    pageNumber={p}
+                    width={THUMB_WIDTH}
+                    renderTextLayer={false}
+                    renderAnnotationLayer={false}
+                    loading=""
+                  />
+                </button>
+              ))}
+            </div>
+            <div style={{ height: railBottomSpacer }} />
           </div>
-        </Document>
-      </div>
+        </div>
+
+        {/* Continuous scroll stage */}
+        <div
+          ref={stage.setContainerRef}
+          className="flex-1 min-w-0 h-full overflow-auto relative"
+        >
+          {error && (
+            <div className="absolute top-8 left-1/2 -translate-x-1/2 bg-danger/10 text-danger p-4 rounded-lg flex items-center gap-2 border border-danger/20 z-10">
+              <AlertCircle size={20} /> {error}
+            </div>
+          )}
+          {isDocLoading && (
+            <div className="absolute inset-0 flex items-center justify-center z-10 pointer-events-none bg-[#111925]">
+              <Loader2
+                className="animate-spin text-accent opacity-50"
+                size={48}
+              />
+            </div>
+          )}
+
+          <div
+            className="mx-auto w-fit min-w-full"
+            style={{ padding: `${STAGE_PAD_Y}px ${STAGE_PAD_X}px` }}
+          >
+            <div style={{ height: stageTopSpacer }} />
+            {/* items-center = pages stay centered at any zoom level */}
+            <div
+              className="flex flex-col items-center"
+              style={{ gap: PAGE_GAP }}
+            >
+              {stagePages.map((p) => (
+                <div
+                  key={p}
+                  className="relative bg-white shadow-[0_8px_30px_rgba(0,0,0,0.5)] shrink-0"
+                  style={{ width: `${pageWidth}px`, height: `${pageHeight}px` }}
+                >
+                  <Page
+                    pageNumber={p}
+                    width={pageWidth}
+                    devicePixelRatio={RENDER_DPR}
+                    renderTextLayer={true}
+                    renderAnnotationLayer={true}
+                    onLoadSuccess={handlePageLoad}
+                    onRenderError={() =>
+                      setError(`Failed to render page ${p}.`)
+                    }
+                    loading=""
+                  />
+                </div>
+              ))}
+            </div>
+            <div style={{ height: stageBottomSpacer }} />
+          </div>
+        </div>
+      </Document>
     </div>
   );
 }
